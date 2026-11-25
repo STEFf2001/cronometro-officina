@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html lang="it">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no">
+  <meta name="theme-color" content="#111418">
+  <meta name="mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+  <meta name="apple-mobile-web-app-title" content="Cronometro">
+  <title>Cronometro officina</title>
+  <link rel="manifest" href="manifest.json">
+  <link rel="icon" href="icone/icona-192.png">
+  <link rel="apple-touch-icon" href="icone/icona-180.png">
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <header id="barra">
+    <button id="btn-home" class="barra-btn" aria-label="Home">⌂</button>
+    <div id="barra-titolo">Cronometro officina</div>
+    <button id="btn-sync" class="barra-sync" aria-label="Stato invio"></button>
+  </header>
+  <main id="vista"></main>
+  <div id="lampo"></div>
+  <div id="dialogo" class="nascosto" role="dialog" aria-modal="true">
+    <div id="dialogo-box"></div>
+  </div>
+  <div id="avviso" class="nascosto"></div>
+  <script src="app.js"></script>
+</body>
+</html>
