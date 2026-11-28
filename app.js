@@ -1,17 +1,22 @@
 /* Cronometro officina – Mondo Metalli
- * Web app (PWA) in JavaScript puro. Versione 1.0.0
+ * Web app (PWA) in JavaScript puro. Versione 1.1.0
  *
  * Principi:
  * - il tempo si calcola SEMPRE dai timestamp degli eventi (Date.now()), mai contando i tick;
  * - lo stato del cronometro si salva a ogni evento, così sopravvive a chiusura e riavvio;
- * - ogni misura salvata va prima nella coda locale e solo dopo si prova a inviarla.
+ * - durante il cronometro il tempo NON si mostra: compare solo nel Controllo dopo lo Stop;
+ * - i dati della misura si compilano a misura finita (Controllo), tranne i provini;
+ * - ogni misura salvata va prima nella coda locale e solo dopo si prova a inviarla;
+ * - niente che dipenda dall'officina è scritto nel codice: tutto arriva dal Google Sheet.
  */
 'use strict';
 
-const VERSIONE = '1.0.0';
+const VERSIONE = '1.1.0';
 const BLOCCO_INVIO = 20;            // misure per chiamata
 const RIPROVA_MS = 60 * 1000;       // nuovo tentativo se la coda non è vuota
 const TIMEOUT_MS = 30 * 1000;
+const LAVORAZIONI_PREDEFINITE = ['Lavoro', 'Attrezzaggio', 'Movimentazione', 'Controllo', 'Attesa'];
+const SUGGERIMENTO_SEZIONE = 'Tondi: D + diametro x spessore (D25x1,5)';
 
 // Chiavi di memoria locale
 const K = {
@@ -22,6 +27,7 @@ const K = {
   cronometri: 'co_cronometri',
   commesse: 'co_commesse',
   contatori: 'co_contatori',
+  ultimi: 'co_ultimi_valori',
   avvisoWake: 'co_avviso_wakelock'
 };
 
@@ -47,7 +53,12 @@ function scrivi(chiave, valore) {
   }
 }
 
-const imp = () => Object.assign({ url: '', token: '', operatore: '', vibrazione: true }, leggi(K.impostazioni, {}));
+/** Impostazioni del telefono. Dalla 1.1 gli operatori sono un elenco (scelta multipla). */
+function imp() {
+  const i = Object.assign({ url: '', token: '', operatori: null, vibrazione: true }, leggi(K.impostazioni, {}));
+  if (!Array.isArray(i.operatori)) i.operatori = i.operatore ? [i.operatore] : [];
+  return i;
+}
 const cfg = () => leggi(K.config, null);
 const coda = () => leggi(K.coda, []);
 
@@ -94,7 +105,7 @@ function dataOra(ts) {
   return `${p.year}-${p.month}-${p.day} ${p.hour}:${p.minute}:${p.second}`;
 }
 
-/** Tempo per lo schermo: mm:ss,d (oppure h:mm:ss,d oltre l'ora). */
+/** Tempo leggibile (solo nel Controllo e nella Coda): mm:ss,d oppure h:mm:ss,d. */
 function fmtTempo(ms) {
   const decimi = Math.floor(Math.max(0, ms) / 100);
   const s = Math.floor(decimi / 10);
@@ -102,8 +113,6 @@ function fmtTempo(ms) {
   const m = Math.floor((s % 3600) / 60);
   return (h ? h + ':' + pad(m) : pad(m)) + ':' + pad(s % 60) + ',' + (decimi % 10);
 }
-
-/** Secondi leggibili: 75,3 s → "1:15,3". */
 const fmtSec = s => fmtTempo(s * 1000);
 
 function aNumero(v) {
@@ -111,6 +120,15 @@ function aNumero(v) {
   const s = String(v).trim().replace(',', '.');
   if (s === '') return '';
   return /^-?\d+(\.\d+)?$/.test(s) ? Number(s) : String(v).trim();
+}
+
+/** Sezioni: niente spazi, D iniziale maiuscola, "x" minuscola, decimali con la virgola. d25 x 1.5 → D25x1,5 */
+function normalizzaSezione(v) {
+  let s = String(v === null || v === undefined ? '' : v).trim();
+  if (!s) return '';
+  s = s.replace(/\s+/g, '').replace(/[X×*]/g, 'x').replace(/\./g, ',');
+  s = s.replace(/^[dDØø⌀]/, 'D');
+  return s;
 }
 
 function dispositivo() {
@@ -133,6 +151,19 @@ function mediana(arr) {
   const s = [...arr].sort((a, b) => a - b);
   const i = Math.floor(s.length / 2);
   return s.length % 2 ? s[i] : (s[i - 1] + s[i]) / 2;
+}
+
+// Colori delle lavorazioni: fissi per posizione nell'elenco di Impostazioni
+const PALETTE = ['#1fae5b', '#f08a24', '#2f81f7', '#c45bd6', '#e0c341', '#26b0b0', '#e05a7a',
+  '#8fa84a', '#b07a50', '#6c7ae0', '#e8eef5', '#4fc3f7', '#9e9e2e', '#d48ac0'];
+function colore(lav) {
+  let i = impFoglio().lavorazioni.indexOf(lav);
+  if (i < 0) { i = 0; for (const ch of String(lav)) i = (i * 31 + ch.charCodeAt(0)) >>> 0; }
+  return PALETTE[i % PALETTE.length];
+}
+function testoSu(hex) {
+  const r = parseInt(hex.slice(1, 3), 16), g = parseInt(hex.slice(3, 5), 16), b = parseInt(hex.slice(5, 7), 16);
+  return 0.299 * r + 0.587 * g + 0.114 * b > 165 ? '#111' : '#fff';
 }
 
 // ---------------------------------------------------------------------------
@@ -192,18 +223,47 @@ const conferma = (titolo, testo, si, no) => chiedi({
 });
 
 // ---------------------------------------------------------------------------
+// Configurazione (Catalogo, Provini_da_fare, Impostazioni)
+// ---------------------------------------------------------------------------
+
+const catalogo = () => (cfg() ? cfg().catalogo : []);
+const operazione = codice => catalogo().find(o => o.codice === codice) || null;
+function impFoglio() {
+  const i = Object.assign(
+    { operatori: [], lavorazioni: null, motiviPausa: ['Altro'], reparti: [], ripetizioniProvino: 3 },
+    cfg() ? cfg().impostazioni : {}
+  );
+  // Configurazione salvata dalla 1.0: la colonna si chiamava "fasi"
+  if (!Array.isArray(i.lavorazioni) || !i.lavorazioni.length) i.lavorazioni = (i.fasi && i.fasi.length) ? i.fasi : LAVORAZIONI_PREDEFINITE;
+  if (!Array.isArray(i.reparti)) i.reparti = [];
+  return i;
+}
+
+/** Lavorazioni del cronometro: la prima è la principale, le altre accessorie. */
+function lavorazioniDi(meta) {
+  if (Array.isArray(meta.lavorazioni) && meta.lavorazioni.length) return meta.lavorazioni;
+  return LAVORAZIONI_PREDEFINITE; // cronometri partiti con la 1.0
+}
+function lavorazioniOperazione(op) {
+  return op && Array.isArray(op.lavorazioni) && op.lavorazioni.length ? op.lavorazioni : LAVORAZIONI_PREDEFINITE;
+}
+const operatoriDi = meta => (Array.isArray(meta.operatori) ? meta.operatori : (meta.operatore ? [meta.operatore] : []));
+
+// ---------------------------------------------------------------------------
 // Calcolo del cronometro dagli eventi
 // ---------------------------------------------------------------------------
-// Eventi: {tipo:'avvio'|'giro'|'pausa'|'ripresa'|'fase'|'stop', t:ms, fase?, motivo?}
+// Eventi: {tipo:'avvio'|'giro'|'pausa'|'ripresa'|'lav'|'stop', t:ms, lav?, motivo?}
+// ('fase' al posto di 'lav' nei cronometri partiti con la 1.0: trattati allo stesso modo)
 
 function calcola(c, ora) {
+  const principale = lavorazioniDi(c.meta)[0];
   const r = {
-    avviato: false, fermato: false, inPausa: false, faseAttiva: null,
+    avviato: false, fermato: false, inPausa: false, lav: principale,
     inizio: null, fine: null, netto: 0, pause: 0, lordo: 0,
-    giri: [], fasi: {}, motivi: {}, dalGiro: 0, motivoPausa: null
+    giri: [], lavorazioni: {}, motivi: {}, motivoPausa: null
   };
   let tPrec = null;
-  let fase = null;
+  let lav = principale;
   let inPausa = false;
   let motivo = null;
   let nettoUltimoGiro = 0;
@@ -215,19 +275,20 @@ function calcola(c, ora) {
       r.motivi[motivo] = (r.motivi[motivo] || 0) + d;
     } else {
       r.netto += d;
-      if (fase) r.fasi[fase] = (r.fasi[fase] || 0) + d;
+      r.lavorazioni[lav] = (r.lavorazioni[lav] || 0) + d;
     }
   };
 
   for (const e of c.eventi) {
     if (tPrec !== null) accumula(e.t - tPrec);
     tPrec = e.t;
+    const nuova = e.lav || e.fase;
     switch (e.tipo) {
-      case 'avvio': r.avviato = true; r.inizio = e.t; if (e.fase) fase = e.fase; break;
+      case 'avvio': r.avviato = true; r.inizio = e.t; if (nuova) lav = nuova; break;
       case 'giro': r.giri.push(r.netto - nettoUltimoGiro); nettoUltimoGiro = r.netto; break;
       case 'pausa': inPausa = true; motivo = e.motivo || 'Senza motivo'; break;
-      case 'ripresa': inPausa = false; if (e.fase) fase = e.fase; break;
-      case 'fase': fase = e.fase; break;
+      case 'ripresa': inPausa = false; if (nuova) lav = nuova; break;
+      case 'lav': case 'fase': if (nuova) lav = nuova; break;
       case 'stop': r.fermato = true; r.fine = e.t; break;
     }
     if (r.fermato) break;
@@ -236,8 +297,7 @@ function calcola(c, ora) {
 
   r.inPausa = inPausa && !r.fermato;
   r.motivoPausa = inPausa ? motivo : null;
-  r.faseAttiva = fase;
-  r.dalGiro = r.netto - nettoUltimoGiro;
+  r.lav = lav;
   r.lordo = r.avviato ? (r.fine || ora) - r.inizio : 0;
   return r;
 }
@@ -251,7 +311,7 @@ function aggiungiEvento(c, ev) {
 }
 
 // ---------------------------------------------------------------------------
-// Configurazione (Catalogo, Provini_da_fare, Impostazioni)
+// Comunicazione con lo script
 // ---------------------------------------------------------------------------
 
 async function chiamaScript(params, corpo) {
@@ -307,19 +367,13 @@ async function aggiornaConfig() {
   };
   scrivi(K.config, nuova);
   const i = imp();
-  if (!i.operatore && nuova.impostazioni.operatori && nuova.impostazioni.operatori.length) {
-    i.operatore = nuova.impostazioni.operatori[0];
-    scrivi(K.impostazioni, i);
-  }
+  const elenco = nuova.impostazioni.operatori || [];
+  const validi = i.operatori.filter(o => elenco.includes(o));
+  if (!validi.length && elenco.length) validi.push(elenco[0]);
+  i.operatori = validi;
+  scrivi(K.impostazioni, i);
   return nuova;
 }
-
-const catalogo = () => (cfg() ? cfg().catalogo : []);
-const operazione = codice => catalogo().find(o => o.codice === codice) || null;
-const impFoglio = () => Object.assign(
-  { operatori: [], fasi: ['Attrezzaggio', 'Lavoro', 'Movimentazione', 'Controllo', 'Attesa'], motiviPausa: ['Altro'], ripetizioniProvino: 3 },
-  cfg() ? cfg().impostazioni : {}
-);
 
 /** Misure locali (in coda o inviate dopo l'ultimo scaricamento) per un riferimento. */
 function misureLocali(tipo, riferimento) {
@@ -337,20 +391,6 @@ function statoProvino(p) {
   if (fatte >= richieste) { testo = 'fatto'; cls = 'fatto'; }
   else if (fatte > 0) { testo = `in corso ${fatte} di ${richieste}`; cls = 'corso'; }
   return { richieste, fatte, testo, cls };
-}
-
-/** Mappa i parametri del Catalogo sulle colonne fisse del Registro. */
-function mappaParametri(valori) {
-  const out = { tecnica: '', materiale: '', spessore_sezione: '', altri: [] };
-  valori.forEach(({ nome, valore }) => {
-    const v = String(valore || '').trim();
-    const n = nome.trim().toLowerCase();
-    if (n === 'tecnica') out.tecnica = v;
-    else if (n === 'materiale') out.materiale = v;
-    else if (n.startsWith('spessore') || n.startsWith('sezione')) out.spessore_sezione = v;
-    else if (v) out.altri.push(`${nome}=${v}`);
-  });
-  return out;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,7 +425,7 @@ function sincronizza() {
     } finally {
       invioInCorso = null;
       aggiornaBarra();
-      if (vistaCorrente.nome === 'coda' || vistaCorrente.nome === 'home') mostra(vistaCorrente, true);
+      if (vistaCorrente.nome === 'coda' || (vistaCorrente.nome === 'home' && !cronoAttivo())) mostra(vistaCorrente, true);
     }
   })();
   aggiornaBarra();
@@ -401,6 +441,18 @@ function aggiornaBarra() {
   else b.textContent = `${ultimoErrore ? '⚠' : '⏳'} ${n} ${n === 1 ? 'misura' : 'misure'} in attesa`;
 }
 
+// Stessa logica dello script, per l'esportazione CSV di emergenza (vale anche per misure della 1.0)
+function lavorazioniMisura(m) {
+  if (m.lavorazioni_s) return m.lavorazioni_s;
+  if (m.modalita === 'fasi' && m.fasi_s) return m.fasi_s;
+  return null;
+}
+function colonnaFissa(m, nome) {
+  const lav = lavorazioniMisura(m);
+  if (!lav) return '';
+  if (nome === 'Lavoro' && m.principale && m.lavorazioni_s) return lav[m.principale] || 0;
+  return lav[nome] || 0;
+}
 const COLONNE_CSV = [
   ['ID misura', m => m.id], ['Ricevuto il', () => ''], ['Inizio', m => m.inizio], ['Fine', m => m.fine],
   ['Operatore', m => m.operatore], ['Tipo', m => m.tipo], ['Riferimento', m => m.riferimento],
@@ -409,19 +461,21 @@ const COLONNE_CSV = [
   ['Materiale', m => m.materiale], ['Spessore / sezione', m => m.spessore_sezione], ['Dettaglio', m => m.dettaglio],
   ['Misura', m => m.misura], ['Unità', m => m.unita], ['Quantità', m => m.quantita],
   ['Tempo netto (s)', m => m.netto_s], ['Pause (s)', m => m.pause_s], ['Tempo lordo (s)', m => m.lordo_s],
-  ['Attrezzaggio (s)', m => fasiCsv(m, 'Attrezzaggio')], ['Lavoro (s)', m => fasiCsv(m, 'Lavoro')],
-  ['Movimentazione (s)', m => fasiCsv(m, 'Movimentazione')], ['Controllo (s)', m => fasiCsv(m, 'Controllo')],
-  ['Attesa (s)', m => fasiCsv(m, 'Attesa')], ['Giri (s)', m => (m.giri_s || []).map(g => g.toFixed(1)).join(';')],
+  ['Attrezzaggio (s)', m => colonnaFissa(m, 'Attrezzaggio')], ['Lavoro (s)', m => colonnaFissa(m, 'Lavoro')],
+  ['Movimentazione (s)', m => colonnaFissa(m, 'Movimentazione')], ['Controllo (s)', m => colonnaFissa(m, 'Controllo')],
+  ['Attesa (s)', m => colonnaFissa(m, 'Attesa')], ['Giri (s)', m => (m.giri_s || []).map(g => g.toFixed(1)).join(';')],
   ['Altri parametri', m => m.altri_parametri], ['Motivi pause', m => m.motivi_pause], ['Note', m => m.note],
-  ['Stato', () => 'valida'], ['Dispositivo', m => m.dispositivo], ['Versione app', m => m.versione]
+  ['Stato', () => 'valida'], ['Dispositivo', m => m.dispositivo], ['Versione app', m => m.versione],
+  ['Persone', m => (m.persone !== undefined ? m.persone : (m.operatore ? String(m.operatore).split('+').length : ''))],
+  ['Lavorazioni (dettaglio)', m => { const l = lavorazioniMisura(m); return l ? Object.keys(l).filter(k => l[k] > 0).map(k => `${k}=${Number(l[k]).toFixed(1)}`).join('; ') : ''; }],
+  ['Op. ciclo', m => m.op_ciclo || '']
 ];
-const fasiCsv = (m, f) => (m.modalita === 'fasi' ? (m.fasi_s || {})[f] || 0 : '');
 
 function esportaCsv() {
   const righe = coda();
   if (!righe.length) { avviso('La coda è vuota: niente da esportare'); return; }
   const cella = v => {
-    let s = typeof v === 'number' ? String(v).replace('.', ',') : String(v === null || v === undefined ? '' : v);
+    const s = typeof v === 'number' ? String(v).replace('.', ',') : String(v === null || v === undefined ? '' : v);
     return /[;"\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
   };
   const testo = [COLONNE_CSV.map(c => c[0]).join(';')]
@@ -484,7 +538,7 @@ function mostra(stato, silenzioso) {
   const vista = $('#vista');
   const scrollPrima = silenzioso ? window.scrollY : 0;
   (VISTE[nome] || VISTE.home)(vista, param);
-  if (silenzioso) window.scrollTo(0, scrollPrima); else window.scrollTo(0, 0);
+  window.scrollTo(0, scrollPrima);
   aggiornaBarra();
   gestisciSchermo();
 }
@@ -494,43 +548,68 @@ window.addEventListener('popstate', e => {
   mostra(e.state || { nome: 'home' });
 });
 
-// Scelta "✎ Altro…" nei menu: permette di scrivere un valore non previsto
+// Scelta "✎ Altro…" (o la voce "altro" del Catalogo) nei menu: si scrive un valore non previsto
 document.addEventListener('change', e => {
   const s = e.target;
-  if (s.tagName === 'SELECT' && s.value === '__altro') {
-    const v = prompt('Scrivi il valore:');
+  if (s.tagName !== 'SELECT') return;
+  if (s.value === '__altro' || s.value.toLowerCase() === 'altro') {
+    let v = prompt('Scrivi il valore:');
     if (v && v.trim()) {
+      v = v.trim();
+      if (s.dataset.ruolo === 'sezione') v = normalizzaSezione(v);
       const o = document.createElement('option');
-      o.textContent = v.trim();
+      o.textContent = v;
       s.insertBefore(o, s.lastElementChild);
-      s.value = v.trim();
+      s.value = v;
     } else {
       s.value = s.dataset.prec || '';
     }
     s.dispatchEvent(new Event('input', { bubbles: true }));
   }
-  if (s.tagName === 'SELECT') s.dataset.prec = s.value;
+  s.dataset.prec = s.value;
 });
 
 // ---------------------------------------------------------------------------
 // Pezzi di interfaccia
 // ---------------------------------------------------------------------------
 
-function campoParam(id, etichetta, opzioni, valore) {
+/** Campo di un parametro: menu se ci sono opzioni A|B|C, tastierino se "#", testo altrimenti. */
+function campoParam(id, etichetta, opzioni, valore, extra) {
   const opz = String(opzioni || '').trim();
   const v = valore === null || valore === undefined ? '' : String(valore);
+  const x = extra || {};
+  const attr = `id="${id}"${x.ruolo ? ` data-ruolo="${x.ruolo}"` : ''}${x.obbligatorio ? ' data-obbligatorio="1"' : ''}`;
+  const titolo = `<span>${esc(etichetta)}${x.obbligatorio ? ' <b class="obbl">*</b>' : ''}${x.suggerimento ? `<br><i>${esc(x.suggerimento)}</i>` : ''}</span>`;
   if (opz && opz !== '#') {
     let lista = opz.split('|').map(s => s.trim()).filter(Boolean);
+    const haAltro = lista.some(o => o.toLowerCase() === 'altro');
+    lista = lista.filter(o => o.toLowerCase() !== 'altro');
     if (v && !lista.includes(v)) lista = [v].concat(lista);
-    return `<label class="campo"><span>${esc(etichetta)}</span>
-      <select id="${id}" data-prec="${esc(v)}"><option value=""></option>
+    return `<label class="campo">${titolo}
+      <select ${attr} data-prec="${esc(v)}"><option value=""></option>
       ${lista.map(o => `<option${o === v ? ' selected' : ''}>${esc(o)}</option>`).join('')}
-      <option value="__altro">✎ Altro…</option></select></label>`;
+      <option value="__altro">✎ ${haAltro ? 'altro' : 'Altro…'}</option></select></label>`;
   }
-  return `<label class="campo"><span>${esc(etichetta)}</span>
-    <input id="${id}" value="${esc(v)}" autocomplete="off"${opz === '#' ? ' inputmode="decimal"' : ''}></label>`;
+  return `<label class="campo">${titolo}
+    <input ${attr} value="${esc(v)}" autocomplete="off"${opz === '#' ? ' inputmode="decimal"' : ''}></label>`;
 }
 const valore = id => { const el = document.getElementById(id); return el ? el.value.trim() : ''; };
+
+/** Pulsanti a scelta multipla per gli operatori. */
+function sceltaOperatori(id, scelti) {
+  const elenco = impFoglio().operatori;
+  const tutti = elenco.concat(scelti.filter(o => !elenco.includes(o)));
+  return `<div class="chips" id="${id}">${tutti.map(o =>
+    `<button type="button" class="chip${scelti.includes(o) ? ' scelto' : ''}" data-o="${esc(o)}">${esc(o)}</button>`).join('')}</div>`;
+}
+function leggiOperatori(id) {
+  return [...document.querySelectorAll(`#${id} .chip.scelto`)].map(b => b.dataset.o);
+}
+function attivaChips(id, quandoCambia) {
+  document.querySelectorAll(`#${id} .chip`).forEach(b => {
+    b.onclick = () => { tocco(); b.classList.toggle('scelto'); if (quandoCambia) quandoCambia(leggiOperatori(id)); };
+  });
+}
 
 function raggruppa(elenco, chiave) {
   const gruppi = new Map();
@@ -542,12 +621,32 @@ function raggruppa(elenco, chiave) {
   return gruppi;
 }
 
-function nuovoCronometro(meta) {
+/** Apre un nuovo cronometro. Se avviaSu è una lavorazione, parte subito su quella. */
+function nuovoCronometro(meta, avviaSu) {
   if (cronoAttivo()) { avviso('C\'è già un cronometro aperto'); return; }
-  const c = { id: uuid(), creatoIl: Date.now(), stato: 'pronto', eventi: [], meta: Object.assign({ operatore: imp().operatore }, meta) };
+  const c = {
+    id: uuid(), creatoIl: Date.now(), stato: 'pronto', eventi: [],
+    meta: Object.assign({ operatori: imp().operatori.slice() }, meta)
+  };
+  if (avviaSu) { c.eventi.push({ tipo: 'avvio', t: Date.now(), lav: avviaSu }); c.stato = 'in corso'; }
   salvaCrono(c);
   tocco();
   vai('cronometro', null, false);
+}
+
+/** Dati comuni di un cronometro partito da un'operazione del Catalogo. */
+function metaDaOperazione(op, extra) {
+  return Object.assign({
+    codice: op.codice, reparto: op.reparto, operazione: op.operazione, modalita: op.modalita || 'singola',
+    unita: op.unita || '', lavorazioni: lavorazioniOperazione(op), cosa: op.cosa || '', obiettivo: 0,
+    valori: null, note: '', opCiclo: ''
+  }, extra);
+}
+
+function indicatore(r, conTesto) {
+  if (!r.avviato) return `<span class="punto fermo"></span>${conTesto ? ' Da avviare' : ''}`;
+  if (r.inPausa) return `<span class="punto fermo"></span>${conTesto ? ' PAUSA' : ''}`;
+  return `<span class="punto" style="--c:${colore(r.lav)}"></span>${conTesto ? ' ' + esc(r.lav) : ''}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -563,24 +662,23 @@ VISTE.home = vista => {
   if (c) {
     const r = calcola(c, Date.now());
     const daControllare = c.stato === 'controllo';
+    let stato;
+    if (daControllare) stato = 'Misura da controllare e salvare';
+    else if (!r.avviato) stato = 'Cronometro pronto, da avviare';
+    else if (r.inPausa) stato = `Cronometro in PAUSA – ${r.lav}`;
+    else stato = `Cronometro in corso – ${r.lav}`;
     vista.innerHTML = `
-      <div class="scheda centro">
-        <p class="piccolo">${daControllare ? 'Misura da controllare e salvare' : r.avviato ? (r.inPausa ? 'Cronometro in pausa' : 'Cronometro in corso') : 'Cronometro pronto (non avviato)'}</p>
-        <h1>${esc(c.meta.titolo)}</h1>
-        <p>${esc(c.meta.operatore)}</p>
-        <div class="crono-tempo" id="home-tempo">${fmtTempo(r.netto)}</div>
-      </div>
-      <button class="btn verde grande" id="torna">${daControllare ? 'Vai al controllo' : 'Torna al cronometro'}</button>`;
+      <button class="banner${r.inPausa || !r.avviato || daControllare ? ' fermo' : ''}" id="torna">
+        <span class="banner-riga">${daControllare ? '<span class="punto fermo"></span>' : indicatore(r)} ${esc(stato)}</span>
+        <span class="banner-titolo">${esc(c.meta.titolo)}</span>
+        <span class="banner-torna">${daControllare ? 'Vai al controllo ›' : 'Torna al cronometro ›'}</span>
+      </button>`;
     $('#torna').onclick = () => { tocco(); vai(daControllare ? 'controllo' : 'cronometro'); };
     return;
   }
-  const i = imp();
-  const operatori = impFoglio().operatori;
   const n = coda().length;
   vista.innerHTML = `
-    <label class="campo"><span>Operatore osservato</span>
-      <select id="operatore">${operatori.map(o => `<option${o === i.operatore ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select>
-    </label>
+    <div class="campo"><span class="piccolo">Operatori osservati</span>${sceltaOperatori('h-op', imp().operatori)}</div>
     <div class="colonna">
       <button class="btn blu grande" id="b-provini">Provini</button>
       <button class="btn verde grande" id="b-commessa">Commessa</button>
@@ -599,8 +697,7 @@ VISTE.home = vista => {
     <div class="spazio"></div>
     <button class="btn" id="b-imp">⚙ Impostazioni</button>
     <p class="piccolo centro">Versione ${VERSIONE}</p>`;
-  $('#operatore').onchange = e => { const x = imp(); x.operatore = e.target.value; scrivi(K.impostazioni, x); };
-  if (!i.operatore && operatori[0]) { i.operatore = operatori[0]; scrivi(K.impostazioni, i); }
+  attivaChips('h-op', scelti => { const x = imp(); x.operatori = scelti; scrivi(K.impostazioni, x); });
   $('#b-provini').onclick = () => { tocco(); vai('provini'); };
   $('#b-commessa').onclick = () => { tocco(); vai('commessa'); };
   $('#b-libera').onclick = () => { tocco(); vai('libera'); };
@@ -645,6 +742,11 @@ VISTE.provini = vista => {
   vista.querySelectorAll('.voce').forEach(b => { b.onclick = () => { tocco(); vai('provino', b.dataset.id); }; });
 };
 
+const CAMPI_PROVINO = [
+  ['tecnica', 'Tecnica'], ['materiale', 'Materiale'], ['spessore_sezione', 'Spessore / sezione'],
+  ['dettaglio', 'Dettaglio'], ['misura', 'Misura'], ['unita', 'Unità']
+];
+
 // ---- Scheda provino ----
 VISTE.provino = (vista, id) => {
   const p = cfg().provini.find(x => x.id === id);
@@ -655,132 +757,81 @@ VISTE.provino = (vista, id) => {
   const qta = parseInt(p.qta, 10) || 1;
   let modalita = op ? op.modalita : 'singola';
   if (qta > 1 && modalita !== 'fasi') modalita = 'serie';
-  const opzioni = nome => {
-    const par = op ? op.parametri.find(x => x.nome.toLowerCase().startsWith(nome)) : null;
-    return par ? par.opzioni : '';
-  };
-  const campi = [
-    ['tecnica', 'Tecnica', opzioni('tecnica')],
-    ['materiale', 'Materiale', opzioni('materiale')],
-    ['spessore_sezione', 'Spessore / sezione', ''],
-    ['dettaglio', 'Dettaglio', ''],
-    ['misura', 'Misura', '#'],
-    ['unita', 'Unità', '']
-  ];
+  const lavs = lavorazioniOperazione(op);
   vista.innerHTML = `
     <h1>${esc(p.id)} · ${esc(p.operazione)}</h1>
-    <p class="piccolo">${esc(p.reparto)} · ${esc(p.codice)} · modalità <b>${esc(modalita)}</b>${modalita === 'serie' ? ` · obiettivo ${qta} ${esc(op ? op.unita : '')}` : ''}</p>
+    <p class="piccolo">${esc(p.reparto)} · ${esc(p.codice)} · modalità <b>${esc(modalita)}</b>${modalita === 'serie' ? ` · obiettivo ${qta} ${esc(p.unita || (op ? op.unita : ''))}` : ''}</p>
     <div class="evidenza"><b>Cosa cronometrare:</b><br>${esc(p.cosa || (op && op.cosa) || '—')}</div>
     <div class="scheda centro"><b style="font-size:24px">Prova ${s.fatte + 1} di ${s.richieste}</b>
-      ${s.fatte >= s.richieste ? '<p class="piccolo">Ripetizioni già completate: questa è una prova in più.</p>' : ''}
-      <p class="piccolo">Operatore: <b>${esc(imp().operatore)}</b> · Q.tà per prova: ${qta}</p></div>
-    <h2>Parametri (modificabili)</h2>
-    ${campi.map(([k, et, o]) => campoParam('p-' + k, et, o, p[k])).join('')}
-    <label class="campo"><span>Note</span><textarea id="p-note"></textarea></label>
+      ${s.fatte >= s.richieste ? '<p class="piccolo">Ripetizioni già completate: questa è una prova in più.</p>' : ''}</div>
+    <dl class="dati scheda">${CAMPI_PROVINO.map(([k, et]) => `<dt>${et}</dt><dd>${esc(p[k] || '—')}</dd>`).join('')}
+      <dt>Q.tà per prova</dt><dd>${qta}</dd><dt>Lavorazioni</dt><dd>${esc(lavs.join(' · '))}</dd></dl>
+    <p class="piccolo">Se manca lo scarto giusto, i dati si correggono nel Controllo dopo lo Stop.</p>
     <button class="btn verde grande" id="inizia">Vai al cronometro</button>`;
-  campi.forEach(([k]) => {
-    const el = document.getElementById('p-' + k);
-    const segna = () => el.classList.toggle('modificato', el.value.trim() !== String(p[k] || '').trim());
-    el.addEventListener('input', segna);
-    el.addEventListener('change', segna);
-  });
   $('#inizia').onclick = () => {
-    const v = {};
-    const modifiche = [];
-    campi.forEach(([k, et]) => {
-      v[k] = valore('p-' + k);
-      const orig = String(p[k] || '').trim();
-      if (v[k] !== orig) modifiche.push(`${et} ${orig || '(vuoto)'}→${v[k] || '(vuoto)'}`);
-    });
-    nuovoCronometro({
-      tipo: 'provino', riferimento: p.id, codice: p.codice, reparto: p.reparto, operazione: p.operazione,
-      modalita, obiettivo: modalita === 'serie' ? qta : 0,
-      tecnica: v.tecnica, materiale: v.materiale, spessore_sezione: v.spessore_sezione, dettaglio: v.dettaglio,
-      misura: aNumero(v.misura), unita: v.unita, quantita: qta, altri_parametri: '',
-      note: valore('p-note'), noteModifiche: modifiche.length ? 'Parametri modificati: ' + modifiche.join(', ') : '',
-      cosa: p.cosa || (op && op.cosa) || '',
+    const provino = {};
+    CAMPI_PROVINO.forEach(([k]) => { provino[k] = p[k] || ''; });
+    provino.qta = qta;
+    nuovoCronometro(metaDaOperazione(op || { codice: p.codice, reparto: p.reparto, operazione: p.operazione, modalita }, {
+      tipo: 'provino', riferimento: p.id, reparto: p.reparto, operazione: p.operazione, modalita,
+      obiettivo: modalita === 'serie' ? qta : 0, unita: p.unita, provino, cosa: p.cosa || (op && op.cosa) || '',
       titolo: `${p.id} · ${p.operazione}`, sottotitolo: `Prova ${s.fatte + 1} di ${s.richieste}`
-    });
+    }));
   };
 };
 
-// ---- Commessa ----
-VISTE.commessa = vista => {
-  $('#barra-titolo').textContent = 'Commessa a fasi';
-  const op = operazione('COM') || catalogo().find(o => o.modalita === 'fasi') || { codice: 'COM', operazione: 'Commessa a fasi', parametri: [], unita: 'pezzi' };
-  const parRep = op.parametri.find(x => x.nome.toLowerCase().startsWith('reparto'));
-  const reparti = parRep && parRep.opzioni ? parRep.opzioni : [...new Set(catalogo().map(o => o.reparto).filter(Boolean))].join('|');
+// ---- Commessa: codice commessa + lavorazione ----
+VISTE.commessa = (vista, param) => {
+  $('#barra-titolo').textContent = 'Commessa';
   const ultime = leggi(K.commesse, []);
-  vista.innerHTML = `
-    <h1>Commessa</h1>
-    ${op.cosa ? `<div class="evidenza">${esc(op.cosa)}</div>` : ''}
+  const rifIniziale = (param && param.riferimento) || '';
+  const com = operazione('COM') || catalogo().find(o => o.modalita === 'fasi');
+  const altre = catalogo().filter(o => o !== com);
+  let html = `
     <label class="campo"><span>Commessa / articolo</span>
-      <input id="c-rif" list="c-ultime" autocomplete="off" autocapitalize="characters"></label>
+      <input id="c-rif" list="c-ultime" autocomplete="off" autocapitalize="characters" value="${esc(rifIniziale)}"></label>
     <datalist id="c-ultime">${ultime.map(u => `<option value="${esc(u)}">`).join('')}</datalist>
-    ${ultime.length ? `<div class="griglia2">${ultime.slice(0, 4).map(u => `<button class="btn rapido" data-v="${esc(u)}">${esc(u)}</button>`).join('')}</div>` : ''}
-    ${campoParam('c-rep', 'Reparto prevalente', reparti, '')}
-    <label class="campo"><span>Quantità pezzi (si può scrivere anche alla fine)</span><input id="c-qta" inputmode="decimal"></label>
-    <label class="campo"><span>Note</span><textarea id="c-note"></textarea></label>
-    <button class="btn verde grande" id="inizia">Vai al cronometro</button>`;
+    ${ultime.length && !rifIniziale ? `<div class="griglia2">${ultime.slice(0, 4).map(u => `<button class="btn rapido" data-v="${esc(u)}">${esc(u)}</button>`).join('')}</div>` : ''}
+    <h2>Lavorazione</h2>
+    ${com ? `<button class="btn verde grande scegli" data-c="${esc(com.codice)}">${esc(com.operazione)}<small>${esc(lavorazioniOperazione(com).join(' · '))}</small></button>` : ''}`;
+  raggruppa(altre, 'reparto').forEach((lista, reparto) => {
+    html += `<h2>${esc(reparto)}</h2><div class="elenco">` + lista.map(o => `
+      <button class="voce scegli" data-c="${esc(o.codice)}"><span class="desc"><b>${esc(o.operazione)}</b><br>${esc(o.codice)} · ${esc(o.modalita)}</span></button>`).join('') + '</div>';
+  });
+  vista.innerHTML = html;
   vista.querySelectorAll('.rapido').forEach(b => { b.onclick = () => { tocco(); $('#c-rif').value = b.dataset.v; }; });
-  $('#inizia').onclick = () => {
-    const rif = valore('c-rif');
-    if (!rif) { avviso('Scrivi il codice della commessa o dell\'articolo'); $('#c-rif').focus(); return; }
-    scrivi(K.commesse, [rif].concat(ultime.filter(u => u !== rif)).slice(0, 10));
-    nuovoCronometro({
-      tipo: 'commessa', riferimento: rif, codice: op.codice, reparto: valore('c-rep'), operazione: op.operazione,
-      modalita: 'fasi', obiettivo: 0, tecnica: '', materiale: '', spessore_sezione: '', dettaglio: '',
-      misura: '', unita: op.unita || 'pezzi', quantita: aNumero(valore('c-qta')), altri_parametri: '',
-      note: valore('c-note'), noteModifiche: '', cosa: op.cosa || '',
-      titolo: `Commessa ${rif}`, sottotitolo: valore('c-rep')
-    });
-  };
+  vista.querySelectorAll('.scegli').forEach(b => {
+    b.onclick = () => {
+      const rif = valore('c-rif');
+      if (!rif) { avviso('Scrivi prima il codice della commessa o dell\'articolo'); $('#c-rif').focus(); window.scrollTo(0, 0); return; }
+      const op = operazione(b.dataset.c);
+      scrivi(K.commesse, [rif].concat(ultime.filter(u => u !== rif)).slice(0, 10));
+      nuovoCronometro(metaDaOperazione(op, {
+        tipo: 'commessa', riferimento: rif,
+        titolo: `${rif} · ${op.operazione}`, sottotitolo: `Commessa ${rif}`
+      }));
+    };
+  });
 };
 
-// ---- Misura libera: scelta dal Catalogo ----
-VISTE.libera = (vista, codice) => {
-  if (!codice) {
-    $('#barra-titolo').textContent = 'Misura libera';
-    let html = '<h1>Scegli l\'operazione</h1>';
-    raggruppa(catalogo(), 'reparto').forEach((lista, reparto) => {
-      html += `<h2>${esc(reparto)}</h2><div class="elenco">` + lista.map(o => `
-        <button class="voce" data-c="${esc(o.codice)}"><span class="desc"><b>${esc(o.operazione)}</b><br>${esc(o.codice)} · ${esc(o.modalita)}</span></button>`).join('') + '</div>';
-    });
-    vista.innerHTML = html;
-    vista.querySelectorAll('.voce').forEach(b => { b.onclick = () => { tocco(); vai('libera', b.dataset.c); }; });
-    return;
-  }
-  const op = operazione(codice);
-  if (!op) { vai('libera', null, true); return; }
-  $('#barra-titolo').textContent = op.codice;
-  vista.innerHTML = `
-    <h1>${esc(op.operazione)}</h1>
-    <p class="piccolo">${esc(op.reparto)} · ${esc(op.codice)} · modalità <b>${esc(op.modalita)}</b></p>
-    ${op.cosa ? `<div class="evidenza"><b>Cosa cronometrare:</b><br>${esc(op.cosa)}</div>` : ''}
-    ${op.parametri.map((par, i) => campoParam('l-par' + i, par.nome, par.opzioni, '')).join('')}
-    <div class="griglia2">
-      <label class="campo"><span>Misura</span><input id="l-misura" inputmode="decimal"></label>
-      <label class="campo"><span>Unità</span><input id="l-unita" value="${esc(op.unita)}"></label>
-    </div>
-    ${op.modalita === 'serie' ? '' : `<label class="campo"><span>Quantità (${esc(op.unita)})</span><input id="l-qta" inputmode="decimal" value="1"></label>`}
-    <label class="campo"><span>Riferimento (facoltativo)</span><input id="l-rif" value="${esc(op.codice)}"></label>
-    <label class="campo"><span>Note</span><textarea id="l-note"></textarea></label>
-    <button class="btn verde grande" id="inizia">Vai al cronometro</button>`;
-  $('#inizia').onclick = () => {
-    const mp = mappaParametri(op.parametri.map((par, i) => ({ nome: par.nome, valore: valore('l-par' + i) })));
-    const rif = valore('l-rif') || op.codice;
-    nuovoCronometro({
-      tipo: 'libera', riferimento: rif, codice: op.codice, reparto: op.reparto, operazione: op.operazione,
-      modalita: op.modalita, obiettivo: 0, tecnica: mp.tecnica, materiale: mp.materiale,
-      spessore_sezione: mp.spessore_sezione, dettaglio: '', misura: aNumero(valore('l-misura')),
-      unita: valore('l-unita'), quantita: op.modalita === 'serie' ? '' : aNumero(valore('l-qta')),
-      altri_parametri: mp.altri.join('; '), note: valore('l-note'), noteModifiche: '', cosa: op.cosa || '',
-      titolo: op.operazione, sottotitolo: rif !== op.codice ? rif : ''
-    });
-  };
+// ---- Misura libera: si sceglie solo l'operazione ----
+VISTE.libera = vista => {
+  $('#barra-titolo').textContent = 'Misura libera';
+  let html = '<h1>Scegli l\'operazione</h1>';
+  raggruppa(catalogo(), 'reparto').forEach((lista, reparto) => {
+    html += `<h2>${esc(reparto)}</h2><div class="elenco">` + lista.map(o => `
+      <button class="voce" data-c="${esc(o.codice)}"><span class="desc"><b>${esc(o.operazione)}</b><br>${esc(o.codice)} · ${esc(o.modalita)}</span></button>`).join('') + '</div>';
+  });
+  vista.innerHTML = html;
+  vista.querySelectorAll('.voce').forEach(b => {
+    b.onclick = () => {
+      const op = operazione(b.dataset.c);
+      nuovoCronometro(metaDaOperazione(op, { tipo: 'libera', riferimento: op.codice, titolo: op.operazione, sottotitolo: 'Misura libera' }));
+    };
+  });
 };
 
-// ---- Cronometro ----
+// ---- Cronometro (senza tempo a schermo) ----
 let avvisatoObiettivo = null;
 
 VISTE.cronometro = vista => {
@@ -790,110 +841,99 @@ VISTE.cronometro = vista => {
   const m = c.meta;
   $('#barra-titolo').textContent = m.titolo;
   const r = calcola(c, Date.now());
+  const lavs = lavorazioniDi(m);
+  const principale = lavs[0];
+  const accessori = lavs.slice(1);
+  const serie = m.modalita === 'serie';
+  const attiva = lav => r.avviato && !r.inPausa && r.lav === lav;
+  const stileLav = lav => { const col = colore(lav); return `--c:${col};--t:${testoSu(col)}`; };
+
   const testa = `
     <div class="crono-testa">
-      <div class="crono-rif">${esc(m.sottotitolo || '')}${m.sottotitolo ? ' · ' : ''}${esc(m.operatore)}</div>
+      <div class="crono-rif">${esc(m.sottotitolo || '')}${m.sottotitolo ? ' · ' : ''}${esc(operatoriDi(m).join(' + '))}</div>
       ${m.cosa ? `<details class="piccolo"><summary>Cosa cronometrare</summary>${esc(m.cosa)}</details>` : ''}
-    </div>
-    <div class="crono-tempo${r.inPausa ? ' pausa' : ''}" id="tempo">${fmtTempo(r.netto)}</div>
-    <div class="crono-stato${r.inPausa ? ' pausa' : ''}" id="stato">${statoTesto(c, r)}</div>`;
+      <div class="crono-indicatore${r.inPausa ? ' pausa' : ''}">${indicatore(r, true)}${r.inPausa && r.motivoPausa ? `<small>${esc(r.motivoPausa)}</small>` : ''}</div>
+    </div>`;
 
-  if (m.modalita === 'fasi') {
-    const fasi = impFoglio().fasi;
-    vista.innerHTML = `
-      ${testa}
-      <div class="fasi">${fasi.map((f, i) => `
-        <button class="fase${r.avviato && !r.inPausa && r.faseAttiva === f ? ' attiva' : ''}" data-f="${i}">
-          ${esc(f)}<span class="t" id="fase-${i}">${fmtTempo(r.fasi[f] || 0)}</span></button>`).join('')}
+  if (!r.avviato) {
+    vista.innerHTML = `${testa}
+      <button class="btn verde enorme" id="b-avvia">AVVIA<small>parte su ${esc(principale)}</small></button>
+      <div class="spazio"></div>
+      <button class="btn contorno-rosso" id="b-annulla">Annulla misura</button>`;
+    $('#b-avvia').onclick = () => {
+      c.stato = 'in corso';
+      aggiungiEvento(c, { tipo: 'avvio', lav: principale });
+      tocco();
+      mostra(vistaCorrente, true);
+    };
+  } else {
+    const giri = r.giri.length;
+    const raggiunto = m.obiettivo && giri >= m.obiettivo;
+    vista.innerHTML = `${testa}
+      ${serie ? `
+        <div class="contatore${raggiunto ? ' raggiunto' : ''}">Pezzi <b>${giri}</b>${m.obiettivo ? ` / ${m.obiettivo}` : ''}</div>
+        <button class="btn blu giro" id="b-giro"${r.inPausa ? ' disabled' : ''}>GIRO</button>` : ''}
+      <button class="lavorazione principale${attiva(principale) ? ' attiva' : ''}" style="${stileLav(principale)}" data-lav="${esc(principale)}">
+        ${attiva(principale) ? '<span class="punto"></span>' : ''}${esc(principale)}</button>
+      ${accessori.length ? `<div class="accessori">${accessori.map(a => `
+        <button class="lavorazione${attiva(a) ? ' attiva' : ''}" style="${stileLav(a)}" data-lav="${esc(a)}">
+          ${attiva(a) ? '<span class="punto"></span>' : ''}${esc(a)}</button>`).join('')}</div>` : ''}
+      <div class="spazio"></div>
+      <div class="griglia2">
+        <button class="btn ${r.inPausa ? 'verde' : 'giallo'} medio" id="b-pausa">${r.inPausa ? 'Riprendi' : 'Pausa'}</button>
+        <button class="btn rosso medio" id="b-stop">Stop</button>
       </div>
       <div class="spazio"></div>
-      <div class="griglia3">
-        <button class="btn ${r.inPausa ? 'verde' : 'giallo'}" id="b-pausa"${r.avviato ? '' : ' disabled'}>${r.inPausa ? 'Riprendi' : 'Pausa'}</button>
-        <button class="btn rosso" id="b-stop"${r.avviato ? '' : ' disabled'}>Stop</button>
+      <div class="griglia2">
+        ${serie ? `<button class="btn" id="b-annullagiro"${giri ? '' : ' disabled'}>Annulla ultimo giro</button>` : ''}
         <button class="btn contorno-rosso" id="b-annulla">Annulla misura</button>
       </div>`;
-    vista.querySelectorAll('.fase').forEach(b => {
+
+    vista.querySelectorAll('.lavorazione').forEach(b => {
       b.onclick = () => {
-        const f = fasi[+b.dataset.f];
+        const lav = b.dataset.lav;
         const ora = calcola(c, Date.now());
-        if (!ora.avviato) { c.stato = 'in corso'; aggiungiEvento(c, { tipo: 'avvio', fase: f }); }
-        else if (ora.inPausa) aggiungiEvento(c, { tipo: 'ripresa', fase: f });
-        else if (ora.faseAttiva !== f) aggiungiEvento(c, { tipo: 'fase', fase: f });
+        if (ora.inPausa) aggiungiEvento(c, { tipo: 'ripresa', lav });
+        else if (ora.lav !== lav) aggiungiEvento(c, { tipo: 'lav', lav });
         tocco();
         mostra(vistaCorrente, true);
       };
     });
-  } else {
-    const serie = m.modalita === 'serie';
-    let principale;
-    if (!r.avviato) principale = '<button class="btn verde enorme" id="b-main">AVVIA</button>';
-    else if (r.inPausa) principale = '<button class="btn verde enorme" id="b-main">RIPRENDI</button>';
-    else if (serie) principale = '<button class="btn blu enorme" id="b-main">GIRO</button>';
-    else principale = '<button class="btn rosso enorme" id="b-main">STOP</button>';
-    const giri = r.giri;
-    const med = mediana(giri);
-    const raggiunto = m.obiettivo && giri.length >= m.obiettivo;
-    vista.innerHTML = `
-      <div class="crono-griglia">
-        <div>
-          ${testa}
-          ${serie ? `<div class="contatore${raggiunto ? ' raggiunto' : ''}" id="contatore">Giri <b>${giri.length}</b>${m.obiettivo ? ` / ${m.obiettivo}` : ''}
-            ${r.avviato && giri.length ? `<div class="piccolo">da ultimo giro: <span id="dalgiro">${fmtTempo(r.dalGiro)}</span></div>` : ''}</div>` : ''}
-        </div>
-        <div>
-          ${principale}
-          <div class="spazio"></div>
-          <div class="griglia2">
-            <button class="btn ${r.inPausa ? 'verde' : 'giallo'}" id="b-pausa"${r.avviato ? '' : ' disabled'}>${r.inPausa ? 'Riprendi' : 'Pausa'}</button>
-            ${serie ? `<button class="btn" id="b-annullagiro"${giri.length ? '' : ' disabled'}>Annulla ultimo giro</button>
-                       <button class="btn rosso" id="b-stop"${r.avviato ? '' : ' disabled'}>Stop</button>` : ''}
-            <button class="btn contorno-rosso" id="b-annulla">Annulla misura</button>
-          </div>
-        </div>
-      </div>
-      ${serie && giri.length ? `<h2>Ultimi giri</h2><div class="giri">${giri.map((g, i) => ({ g, i })).reverse().slice(0, 12).map(({ g, i }) =>
-        `<div class="giro${giri.length >= 3 && med > 0 && Math.abs(g - med) > 0.5 * med ? ' anomalo' : ''}"><span>${i + 1}</span><span>${fmtTempo(g)}</span></div>`).join('')}</div>` : ''}`;
-
-    $('#b-main').onclick = () => {
+    const bg = $('#b-giro');
+    if (bg) bg.onclick = () => {
       const ora = calcola(c, Date.now());
-      if (!ora.avviato) { c.stato = 'in corso'; aggiungiEvento(c, { tipo: 'avvio' }); tocco(); }
-      else if (ora.inPausa) { aggiungiEvento(c, { tipo: 'ripresa' }); tocco(); }
-      else if (serie) {
-        aggiungiEvento(c, { tipo: 'giro' });
-        const n = ora.giri.length + 1;
-        if (m.obiettivo && n === m.obiettivo && avvisatoObiettivo !== c.id) {
-          avvisatoObiettivo = c.id;
-          tocco(true);
-          avviso(`Obiettivo raggiunto: ${n} di ${m.obiettivo}. Puoi continuare o premere Stop.`, 5000);
-        } else tocco();
-      } else { ferma(c); return; }
+      if (ora.inPausa) return;
+      aggiungiEvento(c, { tipo: 'giro' });
+      const n = ora.giri.length + 1;
+      if (m.obiettivo && n === m.obiettivo && avvisatoObiettivo !== c.id) {
+        avvisatoObiettivo = c.id;
+        tocco(true);
+        avviso(`Obiettivo raggiunto: ${n} di ${m.obiettivo}. Puoi continuare o premere Stop.`, 5000);
+      } else tocco();
       mostra(vistaCorrente, true);
     };
-    const bg = $('#b-annullagiro');
-    if (bg) bg.onclick = () => {
+    const bag = $('#b-annullagiro');
+    if (bag) bag.onclick = () => {
       const i = c.eventi.map(e => e.tipo).lastIndexOf('giro');
       if (i < 0) return;
       c.eventi.splice(i, 1);
       salvaCrono(c);
       if (avvisatoObiettivo === c.id) avvisatoObiettivo = null;
       tocco();
-      avviso('Ultimo giro annullato: il suo tempo passa al prossimo giro');
+      avviso('Ultimo giro annullato');
       mostra(vistaCorrente, true);
     };
+    $('#b-pausa').onclick = () => {
+      const ora = calcola(c, Date.now());
+      tocco();
+      if (ora.inPausa) { aggiungiEvento(c, { tipo: 'ripresa' }); mostra(vistaCorrente, true); return; }
+      aggiungiEvento(c, { tipo: 'pausa', motivo: null }); // l'istante è quello del tocco, il motivo si sceglie dopo
+      mostra(vistaCorrente, true);
+      chiediMotivo(c);
+    };
+    $('#b-stop').onclick = () => ferma(c);
   }
 
-  const bp = $('#b-pausa');
-  bp.onclick = async () => {
-    const ora = calcola(c, Date.now());
-    if (!ora.avviato) return;
-    tocco();
-    if (ora.inPausa) { aggiungiEvento(c, { tipo: 'ripresa' }); mostra(vistaCorrente, true); return; }
-    aggiungiEvento(c, { tipo: 'pausa', motivo: null }); // l'istante è quello del tocco, il motivo si sceglie dopo
-    mostra(vistaCorrente, true);
-    chiediMotivo(c);
-  };
-  const bs = $('#b-stop');
-  if (bs) bs.onclick = () => ferma(c);
   $('#b-annulla').onclick = async () => {
     tocco();
     if (await conferma('Annullare la misura?', 'Il tempo registrato andrà perso e non verrà inviato.', 'Sì, annulla misura')) {
@@ -906,13 +946,6 @@ VISTE.cronometro = vista => {
   const up = ultimaPausa(c);
   if (r.inPausa && up && !up.motivo && !chiudiDialogoCorrente) chiediMotivo(c);
 };
-
-function statoTesto(c, r) {
-  if (!r.avviato) return c.meta.modalita === 'fasi' ? 'Tocca una fase per iniziare' : 'Pronto';
-  if (r.inPausa) return `In pausa: ${esc(r.motivoPausa)} · <span id="pausa-t">${fmtTempo(r.pause)}</span>`;
-  if (c.meta.modalita === 'fasi') return `Fase: ${esc(r.faseAttiva || '—')}`;
-  return r.pause > 0 ? `Pause: ${fmtTempo(r.pause)}` : 'In corso';
-}
 
 async function chiediMotivo(c) {
   const motivi = impFoglio().motiviPausa;
@@ -945,26 +978,75 @@ function ferma(c) {
   vai('controllo', null, true);
 }
 
-// Aggiornamento del tempo sullo schermo (~10 volte al secondo). Solo grafica: il calcolo è dai timestamp.
-setInterval(() => {
-  const c = cronoAttivo();
-  if (!c) return;
-  const r = calcola(c, Date.now());
-  const t = document.getElementById('tempo') || document.getElementById('home-tempo');
-  if (t) t.textContent = fmtTempo(r.netto);
-  const pt = document.getElementById('pausa-t');
-  if (pt) pt.textContent = fmtTempo(r.pause);
-  const dg = document.getElementById('dalgiro');
-  if (dg) dg.textContent = fmtTempo(r.dalGiro);
-  if (c.meta.modalita === 'fasi' && vistaCorrente.nome === 'cronometro') {
-    impFoglio().fasi.forEach((f, i) => {
-      const el = document.getElementById('fase-' + i);
-      if (el) el.textContent = fmtTempo(r.fasi[f] || 0);
-    });
-  }
-}, 100);
+// ---- Controllo dopo lo Stop: tempi + dati della misura ----
 
-// ---- Controllo dopo lo Stop ----
+/** Ruolo di un parametro del Catalogo verso le colonne del Registro. */
+function ruoloParametro(nome) {
+  const n = nome.trim().toLowerCase();
+  if (n === 'tecnica') return 'tecnica';
+  if (n === 'materiale') return 'materiale';
+  if (n.startsWith('spessore') || n.startsWith('sezione')) return 'sezione';
+  if (n === 'pezzi') return 'quantita';
+  if (n.startsWith('reparto')) return 'reparto';
+  if (n.startsWith('commessa')) return 'salta'; // è già il Riferimento
+  return 'altro';
+}
+
+/** Campi da compilare nel Controllo. */
+function campiControllo(c, r) {
+  const m = c.meta;
+  const op = operazione(m.codice);
+  const serie = m.modalita === 'serie';
+  const campi = [];
+  const opzioniDi = nome => {
+    const p = op ? op.parametri.find(x => x.nome.toLowerCase() === nome.toLowerCase()) : null;
+    return p ? p : null;
+  };
+  if (m.tipo === 'provino') {
+    const pv = m.provino || {
+      tecnica: m.tecnica, materiale: m.materiale, spessore_sezione: m.spessore_sezione,
+      dettaglio: m.dettaglio, misura: m.misura, unita: m.unita, qta: m.quantita
+    };
+    CAMPI_PROVINO.forEach(([k, et]) => {
+      const ruolo = k === 'spessore_sezione' ? 'sezione' : k;
+      const p = opzioniDi(et);
+      campi.push({
+        chiave: k, nome: et, etichetta: et, ruolo, originale: pv[k] || '', valore: pv[k] || '',
+        opzioni: k === 'misura' ? '#' : (p ? p.opzioni : ''), obbligatorio: !!(p && p.obbligatorio),
+        suggerimento: ruolo === 'sezione' ? SUGGERIMENTO_SEZIONE : ''
+      });
+    });
+    campi.push({
+      chiave: 'quantita', nome: 'Quantità', etichetta: `Quantità${pv.unita ? ' (' + pv.unita + ')' : ''}`, ruolo: 'quantita',
+      opzioni: '#', valore: serie && r.giri.length ? r.giri.length : (pv.qta || 1)
+    });
+    return campi;
+  }
+  const precedenti = m.valori || leggi(K.ultimi, {})[m.codice] || {};
+  const reparti = impFoglio().reparti;
+  const parametri = op ? op.parametri : [];
+  // In serie il numero di giri va nel parametro "N. …" (es. N. punti: un giro = un punto), altrimenti in Pezzi
+  const contaGiri = parametri.find(p => /^n\.\s/i.test(p.nome)) || parametri.find(p => ruoloParametro(p.nome) === 'quantita');
+  parametri.forEach((p, i) => {
+    const ruolo = ruoloParametro(p.nome);
+    if (ruolo === 'salta') return;
+    let opzioni = p.opzioni;
+    if (ruolo === 'reparto' && reparti.length) opzioni = reparti.join('|'); // reparto solo dall'elenco unico
+    let v = precedenti[p.nome] !== undefined ? precedenti[p.nome] : '';
+    if (p === contaGiri && serie && r.giri.length) v = r.giri.length;
+    campi.push({
+      chiave: 'par' + i, nome: p.nome, etichetta: p.nome, ruolo, opzioni, valore: v, obbligatorio: !!p.obbligatorio,
+      suggerimento: ruolo === 'sezione' && p.nome.toLowerCase().startsWith('sezione') ? SUGGERIMENTO_SEZIONE : ''
+    });
+  });
+  if (!campi.some(x => x.ruolo === 'quantita')) {
+    let v = precedenti['Quantità'] !== undefined ? precedenti['Quantità'] : '';
+    if (serie && r.giri.length) v = r.giri.length;
+    campi.push({ chiave: 'quantita', nome: 'Quantità', etichetta: `Quantità${m.unita ? ' (' + m.unita + ')' : ''}`, ruolo: 'quantita', opzioni: '#', valore: v });
+  }
+  return campi;
+}
+
 VISTE.controllo = vista => {
   const c = cronoAttivo();
   if (!c) { vai('home', null, true); return; }
@@ -972,63 +1054,146 @@ VISTE.controllo = vista => {
   const m = c.meta;
   $('#barra-titolo').textContent = 'Controllo misura';
   const r = calcola(c, Date.now());
-  const s = secondi(r);
+  const lavs = lavorazioniDi(m);
+  const s = secondi(r, lavs);
   const serie = m.modalita === 'serie';
-  const qtaPredef = serie ? r.giri.length : (m.quantita === '' || m.quantita === undefined ? '' : m.quantita);
-  const perUnita = () => {
-    const q = aNumero($('#k-qta') ? $('#k-qta').value : qtaPredef);
-    if (serie && r.giri.length) return s.netto / r.giri.length;
-    return typeof q === 'number' && q > 0 ? s.netto / q : null;
-  };
-  let fasiHtml = '';
-  if (m.modalita === 'fasi') {
-    fasiHtml = '<h2>Fasi</h2>' + Object.keys(s.fasi).map(f => {
-      const perc = s.netto > 0 ? (s.fasi[f] / s.netto) * 100 : 0;
-      return `<div class="scheda"><div class="riga"><b>${esc(f)}</b><span style="text-align:right">${fmtSec(s.fasi[f])} · ${perc.toFixed(0)}%</span></div>
-        <div class="barra-perc"><i style="width:${perc.toFixed(1)}%"></i></div></div>`;
-    }).join('');
-  }
+  const campi = campiControllo(c, r);
+  const operatori = operatoriDi(m);
+  const personeIniziali = m.persone || Math.max(operatori.length, 1);
+  const commessa = m.tipo === 'commessa';
+
+  // Giri
+  const med = mediana(s.giri);
+  const anomalo = g => s.giri.length >= 3 && med > 0 && Math.abs(g - med) > 0.5 * med;
+  const nAnomali = s.giri.filter(anomalo).length;
+  const mediaGiro = s.giri.length ? s.giri.reduce((a, b) => a + b, 0) / s.giri.length : null;
+
   vista.innerHTML = `
     <h1>${esc(m.titolo)}</h1>
-    <p class="piccolo">${esc(m.sottotitolo || '')} · ${esc(m.operatore)} · ${dataOra(r.inizio)}</p>
+    <p class="piccolo">${esc(m.sottotitolo || '')} · ${dataOra(r.inizio)}</p>
     <div class="riepilogo">
       <div>Netto<b>${fmtSec(s.netto)}</b></div>
       <div>Pause<b>${fmtSec(s.pause)}</b></div>
-      ${serie ? `<div>Giri<b>${r.giri.length}</b></div>` : `<div>Lordo<b>${fmtSec(s.lordo)}</b></div>`}
-      <div>s per unità<b id="k-unita">—</b></div>
+      ${serie ? `<div>Giri<b>${s.giri.length}</b></div><div>Media giro<b>${mediaGiro === null ? '—' : numIt(mediaGiro) + ' s'}</b></div>`
+              : `<div>Lordo<b>${fmtSec(s.lordo)}</b></div><div>s per unità<b id="k-unita">—</b></div>`}
     </div>
-    ${Object.keys(s.motivi).length ? `<p class="piccolo">Pause: ${esc(s.motiviTesto)}</p>` : ''}
-    ${fasiHtml}
-    <label class="campo"><span>Quantità${m.unita ? ' (' + esc(m.unita) + ')' : ''}${serie ? ' – predefinita = numero di giri' : ''}</span>
-      <input id="k-qta" inputmode="decimal" value="${esc(qtaPredef)}"></label>
-    ${m.noteModifiche ? `<p class="piccolo">${esc(m.noteModifiche)}</p>` : ''}
+    ${s.motiviTesto ? `<p class="piccolo">Pause: ${esc(s.motiviTesto)}</p>` : ''}
+    <div id="k-avvisi"></div>
+    <h2>Lavorazioni</h2>
+    ${Object.keys(s.lavorazioni).map(l => {
+      const perc = s.netto > 0 ? (s.lavorazioni[l] / s.netto) * 100 : 0;
+      return `<div class="scheda"><div class="riga"><b><span class="punto fermo" style="background:${colore(l)}"></span> ${esc(l)}</b>
+        <span style="text-align:right">${fmtSec(s.lavorazioni[l])} · ${perc.toFixed(0)}%</span></div>
+        <div class="barra-perc"><i style="width:${perc.toFixed(1)}%;background:${colore(l)}"></i></div></div>`;
+    }).join('') || '<p class="piccolo">—</p>'}
+    ${s.giri.length ? `<details${nAnomali ? ' open' : ''}><summary>Giri (${s.giri.length}${nAnomali ? `, ${nAnomali} anomali` : ''})</summary>
+      <div class="giri">${s.giri.map((g, i) => `<div class="giro${anomalo(g) ? ' anomalo' : ''}"><span>${i + 1}</span><span>${numIt(g)} s</span></div>`).join('')}</div></details>` : ''}
+
+    <h2>Chi ha lavorato</h2>
+    ${sceltaOperatori('k-op', operatori)}
+    <label class="campo"><span>Persone</span>
+      <select id="k-persone">${[1, 2, 3, 4, 5].map(n => `<option${n === personeIniziali ? ' selected' : ''}>${n}</option>`).join('')}</select></label>
+
+    <h2>Dati della misura</h2>
+    ${campi.map(f => campoParam('k-' + f.chiave, f.etichetta, f.opzioni, f.valore, f)).join('')}
+    ${commessa ? `<label class="campo"><span>Op. ciclo (facoltativo, es. 010)</span><input id="k-ciclo" inputmode="numeric" value="${esc(m.opCiclo || '')}"></label>` : ''}
     <label class="campo"><span>Note</span><textarea id="k-note">${esc(m.note || '')}</textarea></label>
-    <div class="griglia2">
+
+    <div class="colonna">
       <button class="btn verde grande" id="k-salva">Salva</button>
-      <button class="btn contorno-rosso grande" id="k-scarta">Scarta</button>
+      ${commessa ? `<button class="btn blu" id="k-lotto">Salva e lotto successivo</button>
+                    <button class="btn" id="k-nuova">Salva e nuova lavorazione</button>` : ''}
+      <button class="btn contorno-rosso" id="k-scarta">Scarta</button>
     </div>
     <div class="spazio"></div>
     <button class="btn" id="k-riprendi">Stop per errore: riprendi il cronometro</button>`;
-  const aggiornaUnita = () => {
-    const u = perUnita();
-    $('#k-unita').textContent = u === null ? '—' : numIt(u);
-  };
-  aggiornaUnita();
-  $('#k-qta').oninput = aggiornaUnita;
-  if (m.modalita === 'fasi' && qtaPredef === '') $('#k-qta').classList.add('modificato');
 
-  $('#k-salva').onclick = () => {
+  // Persone segue il numero di operatori finché non viene cambiata a mano
+  let personeAMano = !!m.persone;
+  $('#k-persone').onchange = () => { personeAMano = true; };
+  attivaChips('k-op', scelti => { if (!personeAMano && scelti.length) $('#k-persone').value = String(Math.min(scelti.length, 5)); });
+
+  const quantita = () => aNumero(valore('k-quantita') || valore(`k-${(campi.find(f => f.ruolo === 'quantita') || {}).chiave}`));
+  const aggiorna = () => {
+    const q = quantita();
+    const u = $('#k-unita');
+    if (u) u.textContent = typeof q === 'number' && q > 0 ? numIt(s.netto / q) : '—';
+    const avvisi = [];
+    if (serie && !s.giri.length) avvisi.push('Nessun giro registrato: tempo medio = netto ÷ quantità' + (typeof q === 'number' && q > 0 ? ` = ${numIt(s.netto / q)} s` : ''));
+    if (serie && m.tipo === 'libera' && typeof q === 'number' && q < 5) avvisi.push('Meno di 5 pezzi: vale come indicazione, non come tempo standard');
+    $('#k-avvisi').innerHTML = avvisi.map(a => `<div class="evidenza">${esc(a)}</div>`).join('');
+  };
+  vista.querySelectorAll('input, select').forEach(el => {
+    el.addEventListener('input', () => { aggiorna(); el.classList.remove('mancante'); });
+    el.addEventListener('change', () => { aggiorna(); el.classList.remove('mancante'); });
+  });
+  // Evidenzia i campi dei provini cambiati rispetto al foglio
+  campi.filter(f => f.originale !== undefined).forEach(f => {
+    const el = document.getElementById('k-' + f.chiave);
+    const segna = () => el.classList.toggle('modificato', el.value.trim() !== String(f.originale).trim());
+    el.addEventListener('input', segna);
+    el.addEventListener('change', segna);
+  });
+  aggiorna();
+
+  const salva = dopo => {
+    // Controllo dei campi obbligatori
+    const mancanti = campi.filter(f => f.obbligatorio && !valore('k-' + f.chiave));
+    const operatoriScelti = leggiOperatori('k-op');
+    vista.querySelectorAll('.mancante').forEach(el => el.classList.remove('mancante'));
+    mancanti.forEach(f => document.getElementById('k-' + f.chiave).classList.add('mancante'));
+    if (!operatoriScelti.length) $('#k-op').classList.add('mancante');
+    if (mancanti.length || !operatoriScelti.length) {
+      tocco(true);
+      avviso(mancanti.length ? `Manca: ${mancanti.map(f => f.nome).join(', ')}` : 'Scegli almeno un operatore');
+      (document.querySelector('.mancante') || vista).scrollIntoView({ block: 'center' });
+      return;
+    }
     tocco();
-    const misura = costruisciMisura(c, r, s, aNumero(valore('k-qta')), valore('k-note'));
+    const valori = {};
+    campi.forEach(f => { valori[f.nome] = f.ruolo === 'sezione' ? normalizzaSezione(valore('k-' + f.chiave)) : valore('k-' + f.chiave); });
+    const persone = parseInt($('#k-persone').value, 10) || operatoriScelti.length;
+    const opCiclo = valore('k-ciclo');
+    const misura = costruisciMisura(c, r, s, campi, valori, {
+      operatori: operatoriScelti, persone, opCiclo, note: valore('k-note')
+    });
     const q = coda();
     if (!q.some(x => x.id === misura.id)) q.push(misura);
     scrivi(K.coda, q);
+    // Valori proposti per la prossima misura dello stesso codice
+    if (m.tipo !== 'provino') {
+      const ultimi = leggi(K.ultimi, {});
+      ultimi[m.codice] = valori;
+      scrivi(K.ultimi, ultimi);
+    }
+    const i = imp();
+    i.operatori = operatoriScelti;
+    scrivi(K.impostazioni, i);
     eliminaCrono(c.id);
     avviso(`Misura salvata (${misura.riferimento}, ripetizione ${misura.ripetizione})`);
     sincronizza();
-    if (m.tipo === 'provino') vai('provino', m.riferimento, true);
-    else vai('home', null, true);
+
+    if (dopo === 'lotto') {
+      // Stessa commessa e lavorazione, dati copiati, cronometro già partito su Attrezzaggio (o sulla principale)
+      const meta = Object.assign({}, m, {
+        valori, operatori: operatoriScelti, persone: personeAMano ? persone : 0, opCiclo, note: '',
+        sottotitolo: `Commessa ${m.riferimento} · lotto successivo`
+      });
+      nuovoCronometro(meta, lavs.includes('Attrezzaggio') ? 'Attrezzaggio' : lavs[0]);
+      history.replaceState({ nome: 'cronometro', param: null }, '');
+    } else if (dopo === 'nuova') {
+      vai('commessa', { riferimento: m.riferimento }, true);
+    } else if (m.tipo === 'provino') {
+      vai('provino', m.riferimento, true);
+    } else {
+      vai('home', null, true);
+    }
   };
+  $('#k-salva').onclick = () => salva();
+  if (commessa) {
+    $('#k-lotto').onclick = () => salva('lotto');
+    $('#k-nuova').onclick = () => salva('nuova');
+  }
   $('#k-scarta').onclick = async () => {
     tocco();
     if (await conferma('Scartare la misura?', 'Non verrà salvata né inviata.', 'Sì, scarta')) {
@@ -1048,24 +1213,25 @@ VISTE.controllo = vista => {
   };
 };
 
-/** Secondi con un decimale, coerenti: netto = lordo − pause, somma fasi = netto. */
-function secondi(r) {
+/** Secondi con un decimale, coerenti: netto = lordo − pause, somma lavorazioni = netto. */
+function secondi(r, lavs) {
   const lordo = r1(r.lordo / 1000);
   const pause = r1(r.pause / 1000);
   const netto = r1(lordo - pause);
-  const fasi = {};
-  impFoglio().fasi.forEach(f => { fasi[f] = r1((r.fasi[f] || 0) / 1000); });
-  Object.keys(r.fasi).forEach(f => { if (!(f in fasi)) fasi[f] = r1(r.fasi[f] / 1000); });
-  const somma = r1(Object.values(fasi).reduce((a, b) => a + b, 0));
+  // Ordine: lavorazioni del cronometro, poi eventuali altre; solo quelle usate
+  const ordine = lavs.concat(Object.keys(r.lavorazioni).filter(k => !lavs.includes(k)));
+  const lavorazioni = {};
+  ordine.forEach(l => { if (r.lavorazioni[l] > 0) lavorazioni[l] = r1(r.lavorazioni[l] / 1000); });
+  const somma = r1(Object.values(lavorazioni).reduce((a, b) => a + b, 0));
   const diff = r1(netto - somma);
   if (diff !== 0 && somma > 0) {
-    const maggiore = Object.keys(fasi).reduce((a, b) => (fasi[b] > fasi[a] ? b : a));
-    fasi[maggiore] = r1(fasi[maggiore] + diff);
+    const maggiore = Object.keys(lavorazioni).reduce((a, b) => (lavorazioni[b] > lavorazioni[a] ? b : a));
+    lavorazioni[maggiore] = r1(lavorazioni[maggiore] + diff);
   }
   const motivi = {};
   Object.keys(r.motivi).forEach(k => { motivi[k] = r1(r.motivi[k] / 1000); });
   const motiviTesto = Object.keys(motivi).map(k => `${k}=${motivi[k].toFixed(1)}`).join('; ');
-  return { lordo, pause, netto, fasi, motivi, motiviTesto, giri: r.giri.map(g => r1(g / 1000)) };
+  return { lordo, pause, netto, lavorazioni, motivi, motiviTesto, giri: r.giri.map(g => r1(g / 1000)) };
 }
 
 function prossimaRipetizione(meta) {
@@ -1077,7 +1243,7 @@ function prossimaRipetizione(meta) {
   return (cont[meta.tipo + '|' + meta.riferimento] || 0) + 1;
 }
 
-function costruisciMisura(c, r, s, quantita, note) {
+function costruisciMisura(c, r, s, campi, valori, extra) {
   const m = c.meta;
   const ripetizione = prossimaRipetizione(m);
   if (m.tipo !== 'provino') {
@@ -1085,33 +1251,63 @@ function costruisciMisura(c, r, s, quantita, note) {
     cont[m.tipo + '|' + m.riferimento] = ripetizione;
     scrivi(K.contatori, cont);
   }
+  // Mappatura verso le colonne del Registro
+  const col = { tecnica: '', materiale: '', spessore_sezione: '', dettaglio: '', misura: '', unita: m.unita || '', quantita: '', reparto: m.reparto || '' };
+  const altri = [];
+  const modifiche = [];
+  campi.forEach(f => {
+    const v = valori[f.nome];
+    if (f.originale !== undefined) { // provini: confronto con il foglio
+      const orig = f.ruolo === 'sezione' ? normalizzaSezione(f.originale) : String(f.originale).trim();
+      if (v !== orig) modifiche.push(`${f.nome} ${orig || '(vuoto)'}→${v || '(vuoto)'}`);
+    }
+    switch (f.ruolo) {
+      case 'tecnica': if (!col.tecnica) { col.tecnica = v; return; } break;
+      case 'materiale': if (!col.materiale) { col.materiale = v; return; } break;
+      case 'sezione': if (!col.spessore_sezione) { col.spessore_sezione = v; return; } break;
+      case 'quantita': if (col.quantita === '') { col.quantita = aNumero(v); return; } break;
+      case 'reparto': if (v) { col.reparto = v; return; } return;
+      case 'dettaglio': col.dettaglio = v; return;
+      case 'misura': col.misura = aNumero(v); return;
+      case 'unita': col.unita = v; return;
+    }
+    if (v) altri.push(`${f.nome}=${v}`);
+  });
+  const note = [];
+  if (modifiche.length) note.push('Parametri modificati: ' + modifiche.join(', '));
+  if (m.modalita === 'serie' && !s.giri.length) note.push('senza giri');
+  if (extra.note) note.push(extra.note);
+  const lavs = lavorazioniDi(m);
   return {
     id: c.id,
     inizio: dataOra(r.inizio),
     fine: dataOra(r.fine),
-    operatore: m.operatore,
+    operatore: extra.operatori.join(' + '),
+    persone: extra.persone,
     tipo: m.tipo,
     riferimento: m.riferimento,
     ripetizione,
     codice: m.codice,
-    reparto: m.reparto,
+    reparto: col.reparto,
     operazione: m.operazione,
     modalita: m.modalita,
-    tecnica: m.tecnica,
-    materiale: m.materiale,
-    spessore_sezione: m.spessore_sezione,
-    dettaglio: m.dettaglio,
-    misura: m.misura,
-    unita: m.unita,
-    quantita,
+    tecnica: col.tecnica,
+    materiale: col.materiale,
+    spessore_sezione: col.spessore_sezione,
+    dettaglio: col.dettaglio,
+    misura: col.misura,
+    unita: col.unita,
+    quantita: col.quantita,
     netto_s: s.netto,
     pause_s: s.pause,
     lordo_s: s.lordo,
-    fasi_s: m.modalita === 'fasi' ? s.fasi : { Attrezzaggio: 0, Lavoro: 0, Movimentazione: 0, Controllo: 0, Attesa: 0 },
+    principale: lavs[0],
+    lavorazioni_s: s.lavorazioni,
     giri_s: m.modalita === 'serie' ? s.giri : [],
-    altri_parametri: m.altri_parametri || '',
+    altri_parametri: altri.join('; '),
     motivi_pause: s.motiviTesto,
-    note: [m.noteModifiche, note].filter(Boolean).join(' · '),
+    note: note.join(' · '),
+    op_ciclo: extra.opCiclo || '',
     dispositivo: dispositivo(),
     versione: VERSIONE
   };
@@ -1143,27 +1339,27 @@ VISTE.impostazioni = vista => {
   $('#barra-titolo').textContent = 'Impostazioni';
   const i = imp();
   const primo = !i.url || !i.token || !cfg();
-  const operatori = impFoglio().operatori;
   vista.innerHTML = `
     ${primo ? `<h1>Benvenuto</h1><p>Inserisci l'indirizzo dello script (quello che finisce con <b>/exec</b>) e il token, poi premi <b>Salva e scarica</b>.</p>` : '<h1>Impostazioni</h1>'}
     <label class="campo"><span>Indirizzo dello script (/exec)</span>
       <input id="i-url" value="${esc(i.url)}" autocomplete="off" autocapitalize="off" spellcheck="false" inputmode="url"></label>
     <label class="campo"><span>Token</span>
       <input id="i-token" value="${esc(i.token)}" autocomplete="off" autocapitalize="off" spellcheck="false"></label>
-    ${operatori.length ? `<label class="campo"><span>Operatore predefinito</span>
-      <select id="i-op">${operatori.map(o => `<option${o === i.operatore ? ' selected' : ''}>${esc(o)}</option>`).join('')}</select></label>` : ''}
+    ${!primo && impFoglio().operatori.length ? `<div class="campo"><span class="piccolo">Operatori predefiniti</span>${sceltaOperatori('i-op', i.operatori)}</div>` : ''}
     <div class="interruttore"><input type="checkbox" id="i-vib"${i.vibrazione ? ' checked' : ''}><label for="i-vib">Vibrazione a ogni tocco</label></div>
     <div class="spazio"></div>
     <button class="btn verde grande" id="i-salva">Salva e scarica</button>
     <p id="i-esito" class="centro"></p>
     <p class="piccolo centro">Versione app ${VERSIONE} · ${esc(dispositivo())}</p>`;
+  if ($('#i-op')) attivaChips('i-op');
   $('#i-salva').onclick = async () => {
     tocco();
     const nuove = imp();
     nuove.url = valore('i-url');
     nuove.token = valore('i-token');
-    if ($('#i-op')) nuove.operatore = $('#i-op').value;
+    if ($('#i-op')) nuove.operatori = leggiOperatori('i-op');
     nuove.vibrazione = $('#i-vib').checked;
+    delete nuove.operatore;
     if (!/^https:\/\//.test(nuove.url)) { $('#i-esito').textContent = 'L\'indirizzo deve iniziare con https://'; return; }
     scrivi(K.impostazioni, nuove);
     const b = $('#i-salva');

@@ -1,6 +1,6 @@
 /* Service worker: tiene in memoria i file dell'app per aprirla anche senza rete.
  * A ogni nuova versione dell'app cambiare il numero qui sotto, così il telefono scarica i file nuovi. */
-const CACHE = 'cronometro-officina-v1.0.0';
+const CACHE = 'cronometro-officina-v1.1.0';
 const FILE = [
   './',
   './index.html',

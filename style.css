@@ -154,17 +154,62 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--b
 .giro { display: flex; justify-content: space-between; padding: 6px 12px; background: var(--pannello); border-radius: 8px; font-size: 18px; }
 .giro.anomalo { background: #4a1d1d; color: #ffb3b3; border: 1px solid var(--rosso); }
 
-/* Fasi */
-.fasi { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
-.fase {
-  min-height: 108px; border-radius: 18px; border: 3px solid var(--bordo);
-  background: var(--pannello); color: var(--testo); font-size: 22px; font-weight: 800;
-  display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 4px;
+/* Indicatore di cronometro in corso: pallino che pulsa del colore della lavorazione */
+.punto {
+  display: inline-block; width: 20px; height: 20px; border-radius: 50%; vertical-align: -3px;
+  background: var(--c, var(--verde)); box-shadow: 0 0 0 0 var(--c, var(--verde));
+  animation: pulsa 1.3s ease-out infinite;
 }
-.fase .t { font-size: 20px; font-weight: 600; font-variant-numeric: tabular-nums; color: var(--testo2); }
-.fase.attiva { background: var(--verde); border-color: #8ff0b6; color: #fff; box-shadow: 0 0 0 4px rgba(31,174,91,.35); }
-.fase.attiva .t { color: #fff; }
-.fase:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.punto.fermo { background: #7d8590; animation: none; box-shadow: none; }
+@keyframes pulsa {
+  0% { transform: scale(.85); box-shadow: 0 0 0 0 var(--c, var(--verde)); }
+  70% { transform: scale(1); box-shadow: 0 0 0 12px transparent; }
+  100% { transform: scale(.85); box-shadow: 0 0 0 0 transparent; }
+}
+.crono-indicatore { text-align: center; font-size: 26px; font-weight: 800; margin: 10px 0 14px; }
+.crono-indicatore small { display: block; font-size: 16px; font-weight: 500; color: var(--testo2); }
+.crono-indicatore.pausa { color: #a9b2bf; letter-spacing: .06em; }
+
+/* Pulsanti delle lavorazioni (principale + accessori) */
+.lavorazione {
+  display: flex; align-items: center; justify-content: center; gap: 10px; width: 100%;
+  min-height: 92px; padding: 10px; border-radius: 18px;
+  border: 3px solid var(--c); background: var(--pannello); color: var(--testo);
+  font-size: 22px; font-weight: 800; text-align: center;
+}
+.lavorazione.principale { min-height: 22vh; font-size: 32px; margin-bottom: 10px; }
+.lavorazione.attiva { background: var(--c); color: var(--t); box-shadow: 0 0 0 5px rgba(255,255,255,.18); }
+.lavorazione.attiva .punto { --c: var(--t); background: var(--t); }
+.lavorazione:active { filter: brightness(1.25); }
+.accessori { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
+.accessori .lavorazione:last-child:nth-child(odd) { grid-column: 1 / -1; }
+.btn.giro { min-height: 20vh; font-size: 40px; border-radius: 22px; margin-bottom: 10px; }
+.btn.medio { min-height: 84px; font-size: 24px; }
+
+/* Banner "cronometro in corso" in home */
+.banner {
+  display: flex; flex-direction: column; gap: 8px; width: 100%; padding: 22px 16px; text-align: left;
+  border-radius: 20px; border: 3px solid var(--verde); background: #0f3a22; color: #fff;
+}
+.banner.fermo { border-color: var(--giallo); background: #3a2f08; }
+.banner-riga { font-size: 22px; font-weight: 800; }
+.banner-titolo { font-size: 19px; color: #dfe6ee; }
+.banner-torna { font-size: 26px; font-weight: 800; margin-top: 6px; }
+
+/* Operatori a scelta multipla */
+.chips { display: flex; flex-wrap: wrap; gap: 8px; margin: 6px 0 4px; padding: 4px; border-radius: 12px; border: 2px solid transparent; }
+.chip {
+  min-height: 56px; min-width: 96px; padding: 8px 16px; border-radius: 999px;
+  border: 2px solid var(--bordo); background: var(--pannello2); color: var(--testo); font-size: 19px; font-weight: 700;
+}
+.chip.scelto { background: var(--blu); border-color: #9cc3ff; color: #fff; }
+.chip.scelto::before { content: '✓ '; }
+
+/* Campi obbligatori */
+.obbl { color: #ff8f8f; }
+label.campo i { font-style: normal; font-size: 14px; color: var(--giallo); }
+.mancante { border-color: var(--rosso) !important; background: #2a1111 !important; }
+details summary { cursor: pointer; padding: 8px 0; font-size: 17px; }
 
 /* Controllo */
 .riepilogo { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
@@ -197,14 +242,12 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--b
 /* Orizzontale e tablet */
 @media (orientation: landscape) and (max-height: 560px) {
   .btn.enorme { min-height: 50vh; }
-  .crono-tempo { font-size: clamp(48px, 12vw, 120px); }
-  .crono-griglia { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: start; }
-  .fasi { grid-template-columns: repeat(3, 1fr); }
-  .fase { min-height: 84px; }
+  .lavorazione.principale, .btn.giro { min-height: 30vh; }
+  .accessori { grid-template-columns: repeat(3, 1fr); }
+  .lavorazione { min-height: 72px; }
 }
 @media (min-width: 760px) {
-  .crono-griglia { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
-  .fasi { grid-template-columns: repeat(3, 1fr); }
-  .fase:last-child:nth-child(odd) { grid-column: auto; }
-  .btn.enorme { min-height: 46vh; }
+  .accessori { grid-template-columns: repeat(3, 1fr); }
+  .accessori .lavorazione:last-child:nth-child(odd) { grid-column: auto; }
+  .btn.enorme { min-height: 40vh; }
 }
